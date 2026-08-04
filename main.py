@@ -1,10 +1,4 @@
-from src.genai.multi_agent.tools.tools import web_search, scrape_url
+from src.genai.multi_agent.pipelines.pipeline import run_research_pipeline
 
-
-output = web_search("Latest advancements in AI technology")
-
-result = scrape_url.invoke("https://www.futurepedia.io/ai-innovations")
-
-# print(output)
-print(result)
-    
+topic = "The impact of artificial intelligence on the society"
+run_research_pipeline(topic)    
