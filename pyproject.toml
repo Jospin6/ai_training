@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4>=4.15.0",
     "chromadb>=1.5.9",
     "crewai>=0.193.2",
     "datasets>=5.0.0",
