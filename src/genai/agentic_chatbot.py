@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 from typing import Any, Annotated, TypedDict
 from uuid import uuid4
 
@@ -10,9 +11,11 @@ import requests
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.vectorstores import FAISS
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -25,6 +28,9 @@ st.set_page_config(
     page_icon="AI",
     layout="centered",
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+FAISS_INDEX_PATH = PROJECT_ROOT / "notebooks" / "faiss_index"
 
 
 search_runner = DuckDuckGoSearchRun()
@@ -160,14 +166,12 @@ def get_weather(city: str) -> str:
         return "Weatherstack returned an invalid JSON response."
 
 
-tools = [web_search, calculator, get_stock_price, get_weather]
-
 TOOL_SYSTEM_PROMPT = """
 You are an assistant with native tool-calling enabled.
 When a tool is required, use the model's tool call mechanism only.
 Never output XML tags such as <function>...</function> or free-form pseudo tool syntax.
 Never invent tool results.
-If the user asks for live data, calculations, weather, stock prices, or web search, prefer the appropriate tool.
+If the user asks for live data, calculations, weather, stock prices, web search, or questions about the YC PDF knowledge base, prefer the appropriate tool.
 Keep the final answer concise and grounded in the tool output.
 """.strip()
 
@@ -248,6 +252,61 @@ def _format_tool_value(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+
+
+@st.cache_resource
+def build_rag_retriever():
+    embeddings_model = HuggingFaceEndpointEmbeddings(
+        model="BAAI/bge-m3",
+        provider="hf-inference",
+    )
+
+    if not FAISS_INDEX_PATH.exists():
+        raise FileNotFoundError(
+            f"FAISS index not found at {FAISS_INDEX_PATH}. "
+            "Run the notebook indexing step first."
+        )
+
+    vector_store = FAISS.load_local(
+        str(FAISS_INDEX_PATH),
+        embeddings_model,
+        allow_dangerous_deserialization=True,
+    )
+
+    return vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 4},
+    )
+
+
+rag_retriever = build_rag_retriever()
+
+
+@tool
+def rag_tool(query: str) -> str:
+    """Retrieve relevant information from the YC PDF document."""
+    documents = rag_retriever.invoke(query)
+
+    if not documents:
+        return "No relevant information was found in the PDF"
+
+    formatted_documents = []
+
+    for index, document in enumerate(documents, start=1):
+        source = document.metadata.get("source", "Unknown source")
+        page = document.metadata.get("page", "Unknown page")
+
+        formatted_documents.append(
+            f"Document {index}\n"
+            f"Source: {source}\n"
+            f"Page: {page}\n"
+            f"Content: {document.page_content}"
+        )
+
+    return "\n\n".join(formatted_documents)
+
+
+tools = [web_search, calculator, get_stock_price, get_weather, rag_tool]
 
 
 def _is_tool_use_failed(error: Exception) -> bool:
