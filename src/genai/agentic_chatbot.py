@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any, Annotated, TypedDict
 from uuid import uuid4
@@ -12,7 +13,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.vectorstores import FAISS
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
@@ -20,6 +21,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import interrupt, Command
 
 load_dotenv()
 
@@ -166,12 +168,65 @@ def get_weather(city: str) -> str:
         return "Weatherstack returned an invalid JSON response."
 
 
+@tool
+def purchase_stock(symbol: str, quantity: int) -> str:
+    """Ask a human to approve a stock purchase before simulating it."""
+
+    # Pause here so a person can review the order.
+    approval = interrupt(
+        {
+            "action": "purchase_stock",
+            "message": f"Approve buying {quantity} shares of {symbol}?",
+            "symbol": symbol,
+            "quantity": quantity,
+        }
+    )
+
+    # This code runs again after the user approves or rejects the order.
+    if isinstance(approval, dict):
+        decision = str(approval.get("decision", "reject")).lower()
+        final_symbol = str(approval.get("symbol", symbol)).strip().upper() or symbol
+        final_quantity = approval.get("quantity", quantity)
+        reason = str(approval.get("reason", "")).strip()
+    else:
+        decision = "approve" if approval is True else "reject"
+        final_symbol = symbol.upper()
+        final_quantity = quantity
+        reason = ""
+
+    try:
+        final_quantity = int(final_quantity)
+    except (TypeError, ValueError):
+        final_quantity = quantity
+
+    # No real broker call happens here.
+    # This is only a safe simulation for the chatbot demo.
+    if decision == "approve":
+        return (
+            f"Purchase approved. Simulated order for {final_quantity} shares "
+            f"of {final_symbol}."
+        )
+
+    if decision == "edit":
+        return (
+            f"Purchase edited and approved. Simulated order for "
+            f"{final_quantity} shares of {final_symbol}."
+        )
+
+    if reason:
+        return f"Purchase rejected by the human reviewer: {reason}"
+
+    return "Purchase rejected by the human reviewer."
+
+
 TOOL_SYSTEM_PROMPT = """
 You are an assistant with native tool-calling enabled.
 When a tool is required, use the model's tool call mechanism only.
 Never output XML tags such as <function>...</function> or free-form pseudo tool syntax.
 Never invent tool results.
 If the user asks for live data, calculations, weather, stock prices, web search, or questions about the YC PDF knowledge base, prefer the appropriate tool.
+If the user wants to buy stocks, use `purchase_stock` only after the request is clear.
+Never say the stock was bought until the tool finishes and the human approves it.
 Keep the final answer concise and grounded in the tool output.
 """.strip()
 
@@ -254,6 +309,263 @@ def _format_tool_value(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=str)
 
 
+def _extract_latest_human_text(messages: list[BaseMessage]) -> str:
+    # Scan the latest human message first.
+    for message in reversed(messages):
+        if getattr(message, "type", None) == "human":
+            return _message_content_to_text(getattr(message, "content", ""))
+    return ""
+
+
+def _extract_stock_symbol(text: str) -> str | None:
+    # First, try to read the symbol from the failed tool generation payload.
+    patterns = [
+        r'get_stock_price\{\"symbol\":\s*"([^"]+)"\}',
+        r'"symbol":\s*"([^"]+)"',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            symbol = match.group(1).strip().upper()
+            if symbol:
+                return symbol
+
+    # Then, try a simple ticker-like token from the text.
+    ticker_match = re.search(r"\b[A-Z]{1,6}\b", text)
+    if ticker_match:
+        symbol = ticker_match.group(0).strip().upper()
+        if symbol not in {"I", "A", "AN", "THE", "USD"}:
+            return symbol
+
+    return None
+
+
+def _build_manual_stock_response(
+    messages: list[BaseMessage],
+    error: Exception,
+) -> AIMessage | None:
+    # Use the failed tool call first, then fall back to the user's message.
+    error_text = str(error)
+    symbol = _extract_stock_symbol(error_text)
+    if not symbol:
+        symbol = _extract_stock_symbol(_extract_latest_human_text(messages))
+
+    if not symbol:
+        return None
+
+    try:
+        stock_output = get_stock_price.invoke({"symbol": symbol})
+    except Exception:
+        return None
+
+    # Keep the tool used by the fallback visible in the UI.
+    return AIMessage(
+        content=_message_content_to_text(stock_output),
+        additional_kwargs={
+            "manual_tool_usage": [
+                {
+                    "name": "get_stock_price",
+                    "args": {"symbol": symbol},
+                    "output": _message_content_to_text(stock_output),
+                }
+            ]
+        },
+    )
+
+
+def _extract_interrupt_payloads(result: Any) -> list[dict[str, Any]]:
+    # LangGraph can return interrupts as a dict field or as a GraphOutput object.
+    raw_interrupts = []
+
+    if isinstance(result, dict):
+        raw_interrupts = result.get("__interrupt__", []) or []
+    else:
+        raw_interrupts = getattr(result, "interrupts", []) or []
+
+    payloads: list[dict[str, Any]] = []
+
+    for item in raw_interrupts:
+        value = getattr(item, "value", item)
+        if isinstance(value, dict):
+            payloads.append(value)
+        else:
+            payloads.append({"message": str(value)})
+
+    return payloads
+
+
+def _get_result_messages(result: Any) -> list[BaseMessage]:
+    if isinstance(result, dict):
+        return result.get("messages", []) or []
+
+    value = getattr(result, "value", None)
+    if isinstance(value, dict):
+        return value.get("messages", []) or []
+
+    return []
+
+
+def _get_manual_tool_usage(message: BaseMessage | None) -> list[dict[str, Any]]:
+    if message is None:
+        return []
+
+    additional_kwargs = getattr(message, "additional_kwargs", {}) or {}
+    manual_tool_usage = additional_kwargs.get("manual_tool_usage", [])
+
+    if isinstance(manual_tool_usage, list):
+        return [
+            item
+            for item in manual_tool_usage
+            if isinstance(item, dict)
+        ]
+
+    return []
+
+
+def _run_turn(
+    conversation: dict[str, Any],
+    user_input: str | None = None,
+    resume_value: Any | None = None,
+) -> dict[str, Any]:
+    # Use the same thread_id so the graph can resume the same conversation.
+    config = {
+        "configurable": {
+            "thread_id": conversation["thread_id"],
+        }
+    }
+
+    if resume_value is None:
+        if user_input is None:
+            raise ValueError("user_input is required when resume_value is missing.")
+
+        result = workflow.invoke(
+            {
+                "messages": [
+                    HumanMessage(content=user_input),
+                ]
+            },
+            config=config,
+        )
+    else:
+        result = workflow.invoke(
+            Command(resume=resume_value),
+            config=config,
+        )
+
+    interrupts = _extract_interrupt_payloads(result)
+    if interrupts:
+        conversation["pending_hitl"] = interrupts
+        return {
+            "status": "interrupted",
+            "interrupts": interrupts,
+        }
+
+    conversation["pending_hitl"] = []
+    messages = _get_result_messages(result)
+    latest_ai_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if getattr(message, "type", None) == "ai"
+        ),
+        None,
+    )
+
+    assistant_response = _message_content_to_text(
+        getattr(latest_ai_message, "content", "")
+    )
+    tool_usage = _get_manual_tool_usage(latest_ai_message)
+    if not tool_usage:
+        tool_usage = _extract_tool_usage(_latest_turn_messages(messages))
+
+    conversation["messages"].append(
+        {
+            "role": "assistant",
+            "content": assistant_response,
+            "tools": tool_usage,
+        }
+    )
+
+    return {
+        "status": "completed",
+        "assistant_response": assistant_response,
+        "tool_usage": tool_usage,
+    }
+
+
+def _render_hitl_panel(conversation: dict[str, Any]) -> dict[str, Any] | None:
+    pending = conversation.get("pending_hitl") or []
+    if not pending:
+        return None
+
+    # We only expect one purchase review at a time in this app.
+    review = pending[0] if isinstance(pending, list) else pending
+    if not isinstance(review, dict):
+        review = {"message": str(review)}
+
+    st.warning("A stock purchase needs your approval.")
+    st.write(review.get("message", "Review the pending action below."))
+
+    default_symbol = str(review.get("symbol", "")).strip().upper()
+    default_quantity = review.get("quantity", 1)
+
+    try:
+        default_quantity = int(default_quantity)
+    except (TypeError, ValueError):
+        default_quantity = 1
+
+    # These keys keep the widgets stable across reruns.
+    symbol = st.text_input(
+        "Symbol",
+        value=default_symbol,
+        key=f"hitl_symbol_{conversation['id']}",
+    )
+    quantity = st.number_input(
+        "Quantity",
+        min_value=1,
+        value=default_quantity,
+        step=1,
+        key=f"hitl_quantity_{conversation['id']}",
+    )
+    reason = st.text_input(
+        "Reject reason (optional)",
+        key=f"hitl_reason_{conversation['id']}",
+    )
+
+    approve_col, reject_col = st.columns(2)
+
+    with approve_col:
+        approve_clicked = st.button(
+            "Approve purchase",
+            key=f"hitl_approve_{conversation['id']}",
+            use_container_width=True,
+        )
+
+    with reject_col:
+        reject_clicked = st.button(
+            "Reject purchase",
+            key=f"hitl_reject_{conversation['id']}",
+            use_container_width=True,
+        )
+
+    if approve_clicked:
+        # The human can edit the order before approving it.
+        return {
+            "decision": "approve",
+            "symbol": symbol.strip().upper() or default_symbol,
+            "quantity": int(quantity),
+        }
+
+    if reject_clicked:
+        return {
+            "decision": "reject",
+            "reason": reason.strip(),
+        }
+
+    return None
+
+
 @st.cache_resource
 def build_rag_retriever():
     embeddings_model = HuggingFaceEndpointEmbeddings(
@@ -306,7 +618,7 @@ def rag_tool(query: str) -> str:
     return "\n\n".join(formatted_documents)
 
 
-tools = [web_search, calculator, get_stock_price, get_weather, rag_tool]
+tools = [web_search, calculator, get_stock_price, get_weather, rag_tool, purchase_stock]
 
 
 def _is_tool_use_failed(error: Exception) -> bool:
@@ -392,9 +704,15 @@ def create_workflow():
                 last_error = error
                 if _is_tool_use_failed(error) and attempt_index < len(attempts):
                     continue
+                manual_response = _build_manual_stock_response(messages, error)
+                if manual_response is not None:
+                    return {"messages": [manual_response]}
                 raise
 
         if last_error is not None:
+            manual_response = _build_manual_stock_response(messages, last_error)
+            if manual_response is not None:
+                return {"messages": [manual_response]}
             raise last_error
 
         raise RuntimeError("Tool calling failed without a specific error.")
@@ -433,6 +751,8 @@ def _create_conversation(select: bool = True) -> str:
         "title": f"Conversation {st.session_state.conversation_counter}",
         "thread_id": str(uuid4()),
         "messages": [],
+        # Keep one pending approval per conversation.
+        "pending_hitl": [],
     }
 
     if select:
@@ -494,13 +814,26 @@ active_conversation = _get_active_conversation()
 
 _render_messages(active_conversation["messages"])
 
+resume_value = _render_hitl_panel(active_conversation)
+if resume_value is not None:
+    try:
+        # Resume the same graph thread after the human decision.
+        _run_turn(active_conversation, resume_value=resume_value)
+        st.rerun()
+    except Exception as error:
+        st.error(f"Une erreur est survenue : {error}")
 
-user_input = st.chat_input("Ecrivez votre message...")
+
+user_input = st.chat_input(
+    "Ecrivez votre message...",
+    disabled=bool(active_conversation.get("pending_hitl")),
+)
 
 
 if user_input:
     active_conversation = _get_active_conversation()
 
+    # Save the user message before the graph runs.
     active_conversation["messages"].append(
         {
             "role": "user",
@@ -510,52 +843,9 @@ if user_input:
 
     _maybe_refresh_conversation_title(active_conversation, user_input)
 
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    config = {
-        "configurable": {
-            "thread_id": active_conversation["thread_id"],
-        }
-    }
-
     try:
-        with st.chat_message("assistant"):
-            with st.spinner("Analyse en cours..."):
-                result = workflow.invoke(
-                    {
-                        "messages": [
-                            HumanMessage(content=user_input),
-                        ]
-                    },
-                    config=config,
-                )
-
-            latest_ai_message = next(
-                (
-                    message
-                    for message in reversed(result["messages"])
-                    if getattr(message, "type", None) == "ai"
-                ),
-                None,
-            )
-            assistant_response = _message_content_to_text(
-                getattr(latest_ai_message, "content", "")
-            )
-
-            turn_messages = _latest_turn_messages(result["messages"])
-            tool_usage = _extract_tool_usage(turn_messages)
-
-            st.markdown(assistant_response)
-            _render_tool_usage(tool_usage)
-
-        active_conversation["messages"].append(
-            {
-                "role": "assistant",
-                "content": assistant_response,
-                "tools": tool_usage,
-            }
-        )
-
+        # Run the agent once for the new user message.
+        _run_turn(active_conversation, user_input=user_input)
+        st.rerun()
     except Exception as error:
         st.error(f"Une erreur est survenue : {error}")
